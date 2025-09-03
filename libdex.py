@@ -277,6 +277,240 @@ def object_hash(fd, fmt, repo=None):
     
     return object_write(obj, repo)
 
+def kvlm_parse(raw, start=0, dct=None):
+    if not dct: 
+        dct = dict()
+
+    spc = raw.find(b' ', start)
+    nl = raw.find(b'\n', start)
+
+    if(spc < 0) or (nl < spc):
+        assert nl == start
+        dct[None] = raw[start+1:]
+        return dct
+    
+    key = raw[start:spc]
+    end = start
+    while True:
+        end = raw.find(b'\n', end + 1)
+        if raw[end+1] != ord(' '): 
+            break
+    
+    value = raw[spc+1:end].replace(b'\n', b'\n')
+
+    if key in dct:
+        if type(dct[key]) == list:
+            dct[key].append(value)
+        else:
+            dct[key] = [dct[key], value]
+    else:
+        dct[key] = value
+    
+    return kvlm_parse(raw, start=end+1, dct=dct)
+
+def kvlm_serialize(kvlm):
+    ret = b''
+
+    for k in kvlm.keys():
+        if k == None: continue
+        val = kvlm[k]
+
+        if type(val) != list:
+            val = [ val ]
+
+        for v in val:
+            ret += k + b' ' + (v.replace(b'\n')) + b'\n'
+    
+    ret += b'\n' + kvlm[None]
+
+    return ret
+
+class GitCommit(GitObject):
+    fmt=b'commit'
+
+    def deserialize(self, data):
+        self.kvlm = kvlm_parse(data)
+    
+    def serialize(self):
+        return kvlm_serialize(self.kvlm)
+    
+    def init(self):
+        self.kvlm = dict()
+
+argsp = argsubparsers.add_parser("log", help="Display history of a given commit.")
+
+argsp.add_argument("commit",
+                   default="HEAD",
+                   nargs="?",
+                   help="Commit to start at.")
+
+
+def cmd_logs(args):
+    repo = repo_find()
+
+    print("digraph dexlog{")
+    print(" node[shape=rect]")
+    log_graphviz(repo, object_find(repo, args.commit), set())
+    print("}")
+
+def log_graphiz(repo, sha, seen):
+    if sha in seen:
+        return 
+
+    seen.add(sha)
+
+    commit = object_read(repo, sha)
+    message = commit.kvlm[None].decode("utf8").strip()
+    message = message.replace("\\", "\\\\")
+    message = message.replace("\"", "\\\"")
+
+    if "\n" in message:
+        message = message[:message.index("\n")]
+
+    print(f" c_{sha} [label=\"{sha[0:7]}: {message}\"]")
+    assert commit.fmt==b'commit'
+
+    if not b'parent' in commit.kvlm.keys():
+        return
+    
+    parents = commit.kvlm[b'parent']
+
+    if type(parents) != list:
+        parents = [ parents ]
+    
+    for p in parents:
+        p = p.decode("ascii")
+        print(f" c_{sha} -> c_{p};")
+        log_graphiz(repo, p, seen)
+
+class GitTreeLeaf(object):
+    def __init__(self, mode, path, sha):
+        self.mode = mode
+        self.path = path
+        self.sha = sha
+
+def tree_parse_one(raw, start=0):
+    x = raw.find(b' ', start)
+    assert x-start == 5 or x-start == 6
+
+    mode = raw[start:x]
+    if len(mode) == 5:
+        mode = b"0" + mode
+
+    y = raw.find(b'\x00', x)
+    path = raw[x+1:y]
+
+    raw_sha = int.from_bytes(raw[y+1:y+21], "big")
+    sha = format(raw_sha, "040x")
+    return y+21, GitTreeLeaf(mode, path.decode("utf8"), sha)
+
+def tree_parse(raw):
+    pos = 0
+    max = len(raw)
+    ret = list()
+    while pos < max:
+        pos, data = tree_parse_one(raw, pos)
+        ret.append(data)
+    
+    return ret
+
+def tree_leaf_sort_key(leaf):
+    if leaf.mode.startswith(b"10"):
+        return leaf.path
+    else:
+        return leaf.path + "/"
+    
+def tree_serialize(obj):
+    obj.items.sort(key=tree_leaf_sort_key)
+    ret = b''
+    for i in obj.items:
+        ret += i.mode
+        ret += b' '
+        ret += i.path.encode("utf8")
+        ret += b'\x00'
+        sha = int(i.sha, 16)
+        ret += sha.to_bytes(20, byteorder="big")
+    return ret
+
+class GitTree(GitObject):
+    fmt = b'tree'
+
+    def deserialize(self, data):
+        self.items = tree_parse(data)
+    
+    def serialize(self):
+        return tree_serialize(self)
+    
+    def init(self):
+        self.items = list()
+
+argsp = argsubparsers.add_parser("ls-tree", help="Pretty-print a tree object")
+argsp.add_argument("-r",
+                   dest="recusive",
+                   action="store_true",
+                   help="Recurse into sub-trees")
+
+def cmd_ls_tree(args):
+    repo = repo_find()
+    ls_tree(repo, args.tree, args.recursive)
+
+def ls_tree(repo, ref, recursive=None, prefix=""):
+    sha = object_find(repo, ref, fmt=b"tree")
+    obj = object_read(repo, sha)
+    for item in obj.items:
+        if len(item.mode) == 5:
+            type = item.mode[0:1]
+        else: 
+            type = item.mode[0:2]
+
+        match type:
+            case b'04': type = "tree"
+            case b'10': type = "blob"
+            case b'12': type = "blob"
+            case b'16': type = "commit"
+            case _: raise Exception(f"Weird tree leaf mode {item.mode}")
+
+        if not (recursive and type=='tree'):
+            print(f"{'0' * (6 - len(item.mode)) + item.mode.decode("ascii")} {type} {item.sha}\t{os.path.join(prefix, item.path)}")
+        else:
+            ls_tree(repo, item.sha, recursive, os.path.join(prefix, item.path))
+
+argsp = argsubparsers.add_parser("checkout", help="Checkout a commit inside of a directory.")
+
+argsp.add_argument("commit", help="The commit or tree to checkout.")
+
+argsp.add_argument("path", help='The EMPTY directory to checkout on.')
+
+def cmd_checkout(args):
+    repo = repo_find()
+
+    obj = object_read(repo, object_find(repo, args.commit))
+
+    if obj.fmt == b'commit':
+        obj = object_read(repo, obj.kvlm[b'tree'].decode("ascii"))
+
+    if os.path.exists(args.path):
+        if not os.path.isdir(args.path):
+            raise Exception(f"Not a directory {args.path}!")
+        if os.listdir(args.path):
+            raise Exception(f"Not empty {args.path}!")
+    else:
+        os.makedirs(args.path)
+    
+    tree_checkout(repo, obj, os.path.realpath(args.path))
+
+def tree_checkout(repo, tree, path):
+    for item in tree.items:
+        obj = object_read(repo, item.sha)
+        dest = os.path.join(path, item.path)
+
+        if obj.fmt == b'tree':
+            os.mkdir(dest)
+            tree_checkout(repo, obj, dest)
+        elif obj.fmt == b'blob':
+            with open(dest, 'wb') as f:
+                f.write(obj.blobdata)
+
 
 def object_find(repo, name, fmt=None, follow=True):
     return name 
