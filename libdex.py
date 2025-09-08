@@ -345,7 +345,7 @@ argsp.add_argument("commit",
                    help="Commit to start at.")
 
 
-def cmd_logs(args):
+def cmd_log(args):
     repo = repo_find()
 
     print("digraph dexlog{")
@@ -353,7 +353,7 @@ def cmd_logs(args):
     log_graphviz(repo, object_find(repo, args.commit), set())
     print("}")
 
-def log_graphiz(repo, sha, seen):
+def log_graphviz(repo, sha, seen):
     if sha in seen:
         return 
 
@@ -381,7 +381,7 @@ def log_graphiz(repo, sha, seen):
     for p in parents:
         p = p.decode("ascii")
         print(f" c_{sha} -> c_{p};")
-        log_graphiz(repo, p, seen)
+        log_graphviz(repo, p, seen)
 
 class GitTreeLeaf(object):
     def __init__(self, mode, path, sha):
@@ -1027,3 +1027,224 @@ def cmd_status_index_worktree(repo, index):
     for f in all_files:
         if not check_ignore(ignore, f):
             print(" ", f)
+
+def index_write(repo, index):
+    with open(repo_file(repo, "index"), "wb") as f:
+        f.write(b"DIRC")
+        f.write(index.version.to_byte(4, "big"))
+        f.write(len(index.entries).to_bytes(4, "big"))
+
+        idx = 0
+        for e in index.entries:
+            f.write(e.ctime[0].to_byte(4, "big"))
+            f.write(e.ctime[1].to_byte(4, "big"))
+            f.write(e.mtime[0].to_byte(4, "big"))
+            f.write(e.mtime[1].to_byte(4, "big"))
+            f.write(e.dev.to_byte(4, "big"))
+            f.write(e.ino.to_byte(4, "big"))
+
+            mode = (e.mode_type << 12) | e.mode_perms
+            f.write(mode.to_bytes(4, "big"))
+
+            f.write(e.uid.to_bytes(4, "big"))
+            f.write(e.gid.to_byte(4, "big"))
+
+            f.write(e.fsize.to_bytes(4, "big"))
+            f.write(int(e.sha, 16).to_bytes(20, "big"))
+
+            flag_assume_valid = 0x1 << 15 if e.flag_assume_valid else 0
+
+            name_bytes = e.name.encode("utf8")
+            bytes_len = len(name_bytes)
+            if bytes_len >= 0xFFF:
+                name_length = 0xFFF
+            else:
+                name_length = bytes_len
+            f.write(name_bytes)
+            f.write((0).to_bytes(1, "big"))
+
+            idx += 62 + len(name_bytes) + 1
+
+            if idx % 8 != 0:
+                pad = 8 - (idx % 8)
+                f.write((0).to_bytes(pad, "big"))
+                idx += pad
+
+argsp = argsubparsers.add_parser("rm", help="Remove files from the working tree and the index")
+argsp.add_argument("path", nargs="+", help="Files to remove")
+
+def cmd_rm(args):
+    repo = repo_find()
+    rm(repo, args.path)
+
+def rm(repo, paths, delete=True, skip_missing=False):
+    index = index_read(repo)
+
+    worktree = repo.worktree + os.sep
+
+    abspaths = set()
+    for path in paths:
+        abspath = os.path.abspath(path)
+        if abspath.startswith(worktree):
+            abspaths.add(abspath)
+        else:
+            raise Exception(f"Cannot remove paths outside of worktree: {paths}")
+    
+    kept_entries = list()
+    remove = list()
+
+    for e in index.entries:
+        full_path = os.path.join(repo.worktree, e.name)
+
+        if full_path in abspath:
+            remove.append(full_path)
+            abspaths.remove(full_path)
+        else:
+            kept_entries.append(e)
+    
+    if len(abspaths) > 0 and not skip_missing:
+        raise Exception(f"Cannot remove paths not in the index: {abspaths}")
+    
+    if delete:
+        for path in remove:
+            os.unlink(path)
+
+    index.entries = kept_entries
+    index_write(repo, index)
+
+argsp = argsubparsers.add_parser("add", help="Add files contents to the index.")
+argsp.add_argument("path", nargs="+", help="Files to add")
+
+def cmd_add(args):
+    repo = repo_find()
+    add(repo, args.path)
+
+def add(repo, paths, delete=True, skip_missing=False):
+    rm(repo, paths, delete=False, skip_missing=True)
+
+    worktree = repo.worktree + os.sep
+
+    clean_paths = set()
+    for path in paths:
+        abspath = os.path.abspath(path)
+        if not (abspath.startswith(worktree) and os.path.isfile(abspath)):
+            raise Exception(f"Not a file, or outside the worktree: {paths}")
+        relpath = os.path.relpath(abspath, repo.worktree)
+        clean_paths.add(abspath, relpath)
+
+    index = index_read(repo)
+
+    for (abspath, relpath) in clean_paths:
+        with open(abspath, "rb") as fd:
+            sha = object_hash(fd, b"blob", repo)
+
+            stat = os.stat(abspath)
+
+            ctime_s = int(stat.st_ctime)
+            ctime_ns = stat.st_ctime_ns % 10**9
+            mtime_s = int(stat.st_mtime)
+            mtime_ns = stat.st_mtime_ns % 10**9
+
+            entry = GitIndexEntry(ctime=(ctime_s, ctime_ns), mtime=(mtime_s, mtime_ns),dev=stat.st_dev, ino=stat.st_ino, mode_type=0b1000, mode_perms=0o644, uid=stat.st_uid, gid=stat.st_gid, flag_stage=False, name=relpath)
+            index.entries.append(entry)
+        
+    index_write(repo, index)
+
+argsp = argsubparsers.add_parser("commit", help="Record changes to the repository")
+argsp.add_argument("-m", metavar="message", dest="message", help="Message to associate with this commit.")
+
+def gitconfig_read():
+    xdg_config_home = os.environ["XDG_CONFIG_HOME"] if "XDG_CONFIG_HOME" in os.environ else "~/.config"
+    configfiles = [
+        os.path.expanduser(os.path.join(xdg_config_home, "git/config")),
+        os.path.expanduser("~/.gitconfig")
+    ]
+
+    config = configparser.ConfigParser()
+    config.read(configfiles)
+    return config
+
+def gitconfig_user_get(config):
+    if "user" in config:
+        if "name" in config["user"] and "email" in config["user"]:
+            return f"{config['user']['name']} <{config['user']['email']}>"
+    return None 
+
+def tree_from_index(repo, index):
+    contents = dict()
+    contents[""] = list()
+
+    for entry in index.entries:
+        dirname = os.path.dirname(entry.name)
+
+        key = dirname
+        while key != "":
+            if not key in contents:
+                contents[key] = list()
+            key = os.path.dirname(key)
+        
+        contents[dirname].append(entry)
+
+    sorted_paths = sorted(contents.keys(), key=len, reverse=True)
+
+    sha = None 
+
+    for path in sorted_paths:
+        tree = GitTree()
+
+        for entry in contents[path]:
+            if isinstance(entry, GitIndexEntry):
+                leaf_node = f"{entry.mode_type:02o}{entry.mode_perms:04o}".encode("ascii")
+                leaf = GitTreeLeaf(mode=leaf_node, path=os.path.basename(entry.name), sha=entry.sha)
+            else:
+                leaf = GitTreeLeaf(mode=b"040000", path=entry[0], sha=entry[1])
+            
+        sha = object_write(tree, repo)
+
+        parent = os.path.dirname(path)
+        base = os.path.basename(path)
+        contents[parent].append((base, sha))
+    
+    return sha
+
+def commit_create(repo, tree, parent, author, timestamp, message):
+    commit = GitCommit()
+    commit.kvlm[b"tree"] = tree.encode("ascii")
+    if parent:
+        commit.kvlm[b"parent"] = parent.encode("ascii")
+    
+    message = message.strip() + "\n"
+
+    offset = int(timestamp.astimezone().utcoffset().total_seconds())
+    hours = offset // 3600
+    minutes = (offset % 3600) // 60
+    tz = "{}{:02}{:02}".format("+" if offset > 0 else "-", hours, minutes)
+
+    author = author + timestamp.strftime(" %s ") + tz
+
+    commit.kvlm[b"author"] = author.encode("utf8")
+    commit.kvlm[b"committer"] = author.encode("utf8")
+    commit.kvlm[None] = message.encode("utf8")
+
+    return object_write(commit, repo)
+
+def cmd_commit(args):
+    repo = repo_find()
+    index = index_read(repo)
+
+    tree = tree_from_index(repo, index)
+
+    commit = commit_create(repo,
+                           tree,
+                           object_find(repo, "HEAD"),
+                           gitconfig_user_get(gitconfig_read()),
+                           datetime.now(),
+                           args.message)
+
+    active_branch = branch_get_active(repo)
+    if active_branch:
+        with open(repo_file(repo, os.path.join("refs/heads", active_branch)), "w") as fd:
+            fd.write(commit + "\n")
+    else:
+        with open(repo_file(repo, "HEAD"), "w") as fd:
+            fd.write("\n")
